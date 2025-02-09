@@ -1,3 +1,4 @@
 *.obj
 gmp-*
 sdfAnnotateInfo
+.DS_Store
