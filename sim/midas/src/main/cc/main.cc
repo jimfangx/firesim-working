@@ -19,7 +19,7 @@
 // Calls the entry point of the driver.
 // int main(int argc, char **argv) { return entry(argc, argv); }
 
-#define PCI_DEV_FMT "0000:05:00.0"
+#define PCI_DEV_FMT "0000:01:00.0"
 
 
 int edma_write_fd;
@@ -238,7 +238,7 @@ int main() {
 //   }
 //   if (!bus_id) {
     // fprintf(stderr, "Bus ID not specified. Assuming Bus ID 0\n");
-    bus_id = 05;
+    bus_id = 01;
 //   }
 //   if (!device_id) {
     // fprintf(stderr, "Device ID not specified. Assuming Device ID 0\n");
@@ -286,34 +286,37 @@ int main() {
         // write some data using pwrite
 
         // create a buffer to write
-        char *data = (char *)malloc(8);
-        data[0] = 0xd;
-        data[1] = 0xe;
-        data[2] = 0xa;
-        data[3] = 0xd;
-        data[4] = 0xb;
-        data[5] = 0xe;
-        data[6] = 0xe;
-        data[7] = 0xf;
+        //char *data = (char *)malloc(8);
+        //data[0] = 0xd;
+        //data[1] = 0xe;
+        //data[2] = 0xa;
+        //data[3] = 0xd;
+        //data[4] = 0xb;
+        //data[5] = 0xe;
+        //data[6] = 0xe;
+        //data[7] = 0xf;
         // data[8] = 0x9;
-
+	uint32_t data = 0xDEADBEEF;
+	
         // print write fd
-        printf("Write fd: %d\n", edma_write_fd);
-        pwrite(edma_write_fd, data, 8, 0);
+         printf("Write fd: %d\n", edma_write_fd);
+         pwrite(edma_write_fd, &data, sizeof(data), 0);
 
         // read the data back
         // malloc a buffer to read the data into
 
-        char *buf = (char *)calloc(8, 1);
+        //char *buf = (char *)calloc(8, 1);
+        uint32_t read_data = 0;
 
         // print read fd
         printf("Read fd: %d\n", edma_read_fd);
-        uint32_t read_status = pread(edma_read_fd, buf, 8, 0);
-        printf("Read status: %d\n", read_status);
-        printf("Read data: 0x%x\n", buf);
+        uint32_t read_status = pread(edma_read_fd, &read_data, sizeof(read_data), 0);
+        printf("Read data: %d\n", read_status);
+        printf("Read data: 0x%08x\n", read_data);
         // break;
     // } 
     // printf("Write not ready\n");
 
   return 0;
 }
+
