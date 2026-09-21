@@ -1115,6 +1115,22 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
                 run(f"rm -rf {bitstream_tar_unpack_dir}")
                 run(f"tar xvf {remote_sim_dir}/{bitstream_tar} -C {remote_sim_dir}")
 
+                # A partial is an overlay, never a replacement for the full
+                # base. Extract it separately and reject a different base
+                # digest before the FPGA programming operation.
+                partial_bit = None
+                if hwcfg.has_partial_bitstream():
+                    partial_dir = f"{remote_sim_dir}/{self.PLATFORM_NAME}_partial"
+                    run(f"rm -rf {partial_dir} && mkdir -p {partial_dir}")
+                    run(f"tar xvf {remote_sim_dir}/{hwcfg.get_partial_bitstream_tar_filename()} -C {partial_dir}")
+                    partial_bit = run(f"find {partial_dir} -name 'firesim*_partial.bit' -print -quit", warn_only=True).strip()
+                    if not partial_bit:
+                        raise RuntimeError("DFX partial_bitstream_tar did not contain firesim_partial.bit")
+                    expected = run(f"find {partial_dir} -name compatible_base_bit.sha256 -exec cat {{}} \\; -quit", warn_only=True).strip()
+                    actual = run(f"sha256sum {bit} | awk '{{print $1}}'").strip()
+                    if expected and expected != actual:
+                        raise RuntimeError(f"DFX base mismatch for slot {slotno}: partial expects {expected}, full bit is {actual}")
+
                 self.instance_logger(f"""Copying FPGA flashing scripts for {slotno}""")
                 rsync_cap = rsync_project(
                     local_dir=f"../platforms/{self.PLATFORM_NAME}/scripts",
@@ -1141,6 +1157,9 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
                     ),
                 )
                 run(f"""{cmd} --bitstream {bit} --bdf {bdf} --fpga-db {json_db}""")
+                if partial_bit:
+                    self.instance_logger(f"DFX: overlaying partial bitstream {partial_bit}")
+                    run(f"""{cmd} --partial-bitstream {partial_bit} --bdf {bdf} --fpga-db {json_db}""")
 
     def change_pcie_perms(self) -> None:
         if self.instance_assigned_simulations():

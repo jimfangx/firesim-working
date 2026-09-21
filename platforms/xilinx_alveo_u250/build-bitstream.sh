@@ -16,6 +16,10 @@ usage() {
                           See aws-fpga documentation for more info/.
                           For this platform TIMING and AREA supported."
     echo "   --board     : FPGA board {au200,au250,au280}."
+    echo "   --enable_pr : enable U250 Vivado DFX mode (true/false)."
+    echo "   --pr_module_name / --pr_partition_path : comma-separated RP definition."
+    echo "   --pr_project_path : base XPR; selects the RM implementation flow."
+    echo "   --pr_mode   : nonproject (default) or project."
     echo "   --help      : Display this message"
     exit "$1"
 }
@@ -24,6 +28,11 @@ CL_DIR=""
 FREQUENCY=""
 STRATEGY=""
 BOARD=""
+ENABLE_PR=false
+PR_MODULE_NAME=""
+PR_PARTITION_PATH=""
+PR_PROJECT_PATH=""
+PR_MODE=nonproject
 
 # getopts does not support long options, and is inflexible
 while [ "$1" != "" ];
@@ -43,6 +52,21 @@ do
         --board )
             shift
             BOARD=$1 ;;
+        --enable_pr )
+            shift
+            ENABLE_PR=$1 ;;
+        --pr_module_name )
+            shift
+            PR_MODULE_NAME=$1 ;;
+        --pr_partition_path )
+            shift
+            PR_PARTITION_PATH=$1 ;;
+        --pr_project_path )
+            shift
+            PR_PROJECT_PATH=$1 ;;
+        --pr_mode )
+            shift
+            PR_MODE=$1 ;;
         * )
             echo "invalid option $1"
             usage 1 ;;
@@ -70,6 +94,29 @@ if [ -z "$BOARD" ] ; then
     usage 1
 fi
 
-# run build
-cd $CL_DIR
-vivado -mode batch -source $CL_DIR/scripts/main.tcl -tclargs $FREQUENCY $STRATEGY $BOARD
+cd "$CL_DIR"
+if [ "$ENABLE_PR" != true ]; then
+    vivado -mode batch -source "$CL_DIR/scripts/main.tcl" -tclargs "$FREQUENCY" "$STRATEGY" "$BOARD"
+    exit 0
+fi
+
+if [ -z "$PR_MODULE_NAME" ]; then
+    echo "--pr_module_name is required for a DFX build" >&2
+    exit 1
+fi
+
+if [ -n "$PR_PROJECT_PATH" ]; then
+    if [ -z "$PR_PARTITION_PATH" ]; then
+        echo "DFX RM requires partition paths from base metadata" >&2
+        exit 1
+    fi
+    case "$PR_MODE" in
+      nonproject) script=main_pr_rm_nonproject.tcl ;;
+      project) script=main_pr_rm.tcl ;;
+      *) echo "invalid --pr_mode $PR_MODE" >&2; exit 1 ;;
+    esac
+    vivado -mode batch -source "$CL_DIR/scripts/$script" -tclargs "$FREQUENCY" "$STRATEGY" "$BOARD" "$PR_MODULE_NAME" "$PR_PARTITION_PATH" "$PR_PROJECT_PATH"
+else
+    vivado -mode batch -source "$CL_DIR/scripts/main_pr.tcl" -tclargs "$FREQUENCY" "$STRATEGY" "$BOARD" "$PR_MODULE_NAME" "$PR_PARTITION_PATH"
+    python3 "$CL_DIR/scripts/pr_metadata.py" --project-dir "$CL_DIR/vivado_proj" --frequency "$FREQUENCY" --modules "$PR_MODULE_NAME"
+fi

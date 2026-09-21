@@ -15,7 +15,7 @@ from util.deepmerge import deep_merge
 from util.targetprojectutils import extra_target_project_make_args, resolve_path
 
 # imports needed for python type checking
-from typing import Set, Any, Optional, Dict, TYPE_CHECKING
+from typing import Set, Any, Optional, Dict, TYPE_CHECKING, List, Union
 
 if TYPE_CHECKING:
     from buildtools.buildconfigfile import BuildConfigFile
@@ -150,10 +150,26 @@ class BuildConfig:
 
         # retrieve frequency and strategy selections
         bitstream_build_args = recipe_config_dict["platform_config_args"]
-        self.fpga_frequency = bitstream_build_args["fpga_frequency"]
+        # PR RMs inherit the clock generator frozen in their base shell, so a
+        # base frequency is optional only when a base artifact is named.
+        self.fpga_frequency = bitstream_build_args.get("fpga_frequency")
         self.build_strategy = BuildStrategy.from_string(
             bitstream_build_args["build_strategy"]
         )
+        self.enable_pr = bool(bitstream_build_args.get("enable_pr", False))
+        self.pr_module_name = self._as_list(bitstream_build_args.get("pr_module_name"), "pr_module_name")
+        self.pr_partition_path = self._as_list(bitstream_build_args.get("pr_partition_path"), "pr_partition_path")
+        self.pr_project_path = bitstream_build_args.get("pr_project_path")
+        self.pr_base_recipe = bitstream_build_args.get("pr_base_recipe")
+        self.pr_mode = bitstream_build_args.get("pr_mode", "nonproject")
+        if self.pr_mode not in ("project", "nonproject"):
+            raise InvalidBuildConfigSetting("pr_mode must be 'project' or 'nonproject'")
+        if self.enable_pr and not self.pr_module_name and not (self.pr_project_path or self.pr_base_recipe):
+            raise InvalidBuildConfigSetting("pr_module_name is required for a DFX base build")
+        if self.pr_project_path and self.pr_base_recipe:
+            raise InvalidBuildConfigSetting("Specify either pr_project_path or pr_base_recipe, not both")
+        if self.pr_partition_path and self.pr_module_name and len(self.pr_partition_path) != len(self.pr_module_name):
+            raise InvalidBuildConfigSetting("pr_partition_path and pr_module_name must have equal lengths")
 
         # retrieve the bitbuilder section
         bitbuilder_conf_dict = None
@@ -178,7 +194,9 @@ class BuildConfig:
             )
 
         # validate the frequency
-        if (self.fpga_frequency is None) or not (0 < self.fpga_frequency <= 300.0):
+        if self.fpga_frequency is None and not (self.enable_pr and (self.pr_project_path or self.pr_base_recipe)):
+            raise Exception("fpga_frequency is required except for a DFX RM that inherits a base shell")
+        if self.fpga_frequency is not None and not (0 < self.fpga_frequency <= 300.0):
             raise Exception(
                 f"{self.fpga_frequency} is not a valid build frequency. Valid frequencies are between 0.0-300.0 (MHz)"
             )
@@ -242,6 +260,34 @@ class BuildConfig:
             Specified build strategy
         """
         return self.build_strategy
+
+    @staticmethod
+    def _as_list(value: Any, field: str) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return value
+        raise InvalidBuildConfigSetting(f"{field} must be a string or list of strings")
+
+    def get_enable_pr(self) -> bool:
+        return self.enable_pr
+
+    def get_pr_module_name(self) -> Optional[List[str]]:
+        return self.pr_module_name
+
+    def get_pr_partition_path(self) -> Optional[List[str]]:
+        return self.pr_partition_path
+
+    def get_pr_project_path(self) -> Optional[str]:
+        return self.pr_project_path
+
+    def get_pr_base_recipe(self) -> Optional[str]:
+        return self.pr_base_recipe
+
+    def get_pr_mode(self) -> str:
+        return self.pr_mode
 
     def get_build_dir_name(self) -> str:
         """Get the name of the local build directory.

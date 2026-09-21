@@ -16,7 +16,7 @@ scriptPath = Path(__file__).resolve().parent
 # firesim specific location of where to read/write database file
 dbPath = Path() # must be overridden by cmdline
 
-def program_fpga(vivado: Path, serial: str, bitstream: str) -> None:
+def program_fpga(vivado: Path, serial: str, bitstream: str, partial: bool = False) -> None:
     progTcl = scriptPath / 'program_fpga.tcl'
     assert progTcl.exists(), f"Unable to find {progTcl}"
     rc, stdout, stderr = util.call_vivado(
@@ -25,7 +25,7 @@ def program_fpga(vivado: Path, serial: str, bitstream: str) -> None:
             '-source', str(progTcl),
             '-tclargs',
                 '-serial', serial,
-                '-bitstream_path', bitstream,
+                '-partial_bitstream_path' if partial else '-bitstream_path', bitstream,
         ]
     )
     if rc != 0:
@@ -80,7 +80,8 @@ def main(args: List[str]) -> int:
     parser.add_argument("--hw-server-bin", help="Explicit path to 'hw_server'", type=Path)
     parser.add_argument("--fpga-db", help="Explicit path to FPGA DB file (used to resolve BDFs to serial numbers or obtain all serial numbers of FPGAs)", type=Path, required=True)
     megroup2 = parser.add_mutually_exclusive_group(required=True)
-    megroup2.add_argument("--bitstream", help="The bitstream to flash onto FPGA(s)", type=Path)
+    megroup2.add_argument("--bitstream", help="The full bitstream to flash onto FPGA(s)", type=Path)
+    megroup2.add_argument("--partial-bitstream", help="A DFX partial bitstream to overlay", type=Path)
     megroup2.add_argument("--disconnect-bdf", help="Disconnect BDF(s)", action="store_true")
     megroup2.add_argument("--reconnect-bdf", help="Reconnect BDF(s)", action="store_true")
     parsed_args = parser.parse_args(args)
@@ -144,11 +145,13 @@ def main(args: List[str]) -> int:
         assert pcielib.any_device_exists(bus_id), f"{bus_id} not visible. Check for proper rescan."
 
     # program based on bitstream
-    if parsed_args.bitstream is not None:
-        if not parsed_args.bitstream.is_file() or not parsed_args.bitstream.exists():
-            sys.exit(f":ERROR: Invalid bitstream: {parsed_args.bitstream}")
+    if parsed_args.bitstream is not None or parsed_args.partial_bitstream is not None:
+        partial = parsed_args.partial_bitstream is not None
+        selected_bitstream = parsed_args.partial_bitstream if partial else parsed_args.bitstream
+        if not selected_bitstream.is_file() or not selected_bitstream.exists():
+            sys.exit(f":ERROR: Invalid bitstream: {selected_bitstream}")
         else:
-            parsed_args.bitstream = parsed_args.bitstream.absolute()
+            selected_bitstream = selected_bitstream.absolute()
 
         if is_bdf_arg(parsed_args):
             bus_ids = get_bus_ids_from_args(parsed_args)
@@ -158,17 +161,19 @@ def main(args: List[str]) -> int:
             for bus_id in bus_ids:
                 serialNums.append(get_serial_from_bus_id(bus_id))
 
-            for bus_id in bus_ids:
-                disconnect_bus_id(bus_id)
+            if not partial:
+                for bus_id in bus_ids:
+                    disconnect_bus_id(bus_id)
 
             # program fpga(s) separately if doing multiple bdfs
             for i, bus_id in enumerate(bus_ids):
                 serialNumber = serialNums[i]
-                program_fpga(parsed_args.vivado_bin, serialNumber, parsed_args.bitstream)
-                print(f":INFO: Successfully programmed FPGA {bus_id} with {parsed_args.bitstream}")
+                program_fpga(parsed_args.vivado_bin, serialNumber, selected_bitstream, partial)
+                print(f":INFO: Successfully programmed FPGA {bus_id} with {selected_bitstream}")
 
-            for bus_id in bus_ids:
-                reconnect_bus_id(bus_id)
+            if not partial:
+                for bus_id in bus_ids:
+                    reconnect_bus_id(bus_id)
 
         if parsed_args.serial or parsed_args.all_serials:
             serials = []
@@ -178,8 +183,8 @@ def main(args: List[str]) -> int:
                 serials.extend(get_serials())
 
             for serial in serials:
-                program_fpga(parsed_args.vivado_bin, serial, parsed_args.bitstream)
-                print(f":INFO: Successfully programmed FPGA {serial} with {parsed_args.bitstream}")
+                program_fpga(parsed_args.vivado_bin, serial, selected_bitstream, partial)
+                print(f":INFO: Successfully programmed FPGA {serial} with {selected_bitstream}")
             print(":WARNING: Please warm reboot the machine")
 
     # disconnect bdfs

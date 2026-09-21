@@ -200,6 +200,8 @@ class RuntimeHWConfig:
     driver_type_message: str
     """User-specified, URI path to driver tarball"""
     driver_tar: Optional[str]
+    """Optional DFX RM tar containing firesim_partial.bit and its base digest."""
+    partial_bitstream_tar: Optional[str]
 
     """ A list of URIContainer objects, one for each URI that is able to be specified """
     uri_list: list[URIContainer]
@@ -221,6 +223,7 @@ class RuntimeHWConfig:
         self.agfi = hwconfig_dict.get("agfi")
         self.bitstream_tar = hwconfig_dict.get("bitstream_tar")
         self.driver_tar = hwconfig_dict.get("driver_tar")
+        self.partial_bitstream_tar = hwconfig_dict.get("partial_bitstream_tar")
 
         self.platform = None
         self.driver_built = False
@@ -238,6 +241,8 @@ class RuntimeHWConfig:
             self.uri_list.append(
                 URIContainer("bitstream_tar", self.get_bitstream_tar_filename())
             )
+            if self.partial_bitstream_tar is not None:
+                self.uri_list.append(URIContainer("partial_bitstream_tar", self.get_partial_bitstream_tar_filename()))
 
         if (
             "deploy_triplet_override" in hwconfig_dict.keys()
@@ -304,6 +309,13 @@ class RuntimeHWConfig:
     def get_bitstream_tar_filename(cls) -> str:
         """Get the name of the bit tar file inside the sim_slot_X directory on the run host."""
         return "firesim.tar.gz"
+
+    @classmethod
+    def get_partial_bitstream_tar_filename(cls) -> str:
+        return "firesim_partial.tar.gz"
+
+    def has_partial_bitstream(self) -> bool:
+        return self.partial_bitstream_tar is not None
 
     def get_platform(self) -> str:
         assert self.platform is not None
@@ -1259,5 +1271,4 @@ class RuntimeConfig:
         self.firesim_topology_with_passes.run_workload_passes(
             use_mock_instances_for_testing
         )
-
 

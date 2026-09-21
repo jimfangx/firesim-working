@@ -5,6 +5,13 @@ set vivado_version_major [string range $vivado_version 0 3]
 set ifrequency           [lindex $argv 0]
 set istrategy            [lindex $argv 1]
 set iboard               [lindex $argv 2]
+# main_pr.tcl passes these two optional arguments. Keeping this switch inside
+# the normal project script avoids maintaining two drifting base flows.
+set pr_enabled [expr {[llength $argv] >= 4}]
+set pr_module_name_str [lindex $argv 3]
+set pr_partition_path_str [lindex $argv 4]
+set pr_module_names [split $pr_module_name_str ","]
+set pr_partition_paths [expr {$pr_partition_path_str eq "" ? {} : [split $pr_partition_path_str ","]}]
 
 proc retrieveVersionedFile { filename version } {
   set first [file rootname $filename]
@@ -34,6 +41,7 @@ delete_files [list ${root_dir}/vivado_proj/firesim.bit]
 
 create_project -force firesim ${root_dir}/vivado_proj -part $part
 set_property board_part $board_part [current_project]
+if {$pr_enabled} { set_property PR_FLOW 1 [current_project] }
 
 # Loading all the verilog files
 foreach addFile [list \
@@ -41,7 +49,6 @@ foreach addFile [list \
     ${root_dir}/design/axi.vh \
     ${root_dir}/design/helpers.vh \
     ${root_dir}/design/overall_fpga_top.v \
-    ${root_dir}/design/FireSim-generated.sv \
     ${root_dir}/design/FireSim-generated.defines.vh \
     ${root_dir}/design/aurora/aurora_64b66b_0_driver.v \
     ${root_dir}/design/aurora/aurora_64b66b_0_cdc_sync_exdes.v \
@@ -55,6 +62,19 @@ foreach addFile [list \
   }
 }
 
+# DFX RMs must compile the same per-module sources used by the base. Prefer
+# split Verilog when supplied by replace-rtl; retain the monolithic path for
+# every existing non-DFX configuration.
+set split_verilog_dir ${root_dir}/design/split-verilog
+set split_files [glob -nocomplain ${split_verilog_dir}/*.sv]
+if {[llength $split_files] > 0} {
+  foreach split_file $split_files { add_files $split_file }
+} else {
+  set generated [retrieveVersionedFile ${root_dir}/design/FireSim-generated.sv $vivado_version]
+  check_file_exists $generated
+  add_files $generated
+}
+
 set desired_host_frequency $ifrequency
 set strategy $istrategy
 
@@ -65,6 +85,16 @@ source $sourceFile
 # Making wrapper around bd
 generate_target all [get_files ${root_dir}/vivado_proj/firesim.srcs/sources_1/bd/design_1/design_1.bd]
 update_compile_order -fileset sources_1
+
+if {$pr_enabled} {
+  # Establish blocksets before synthesis; each partition's hierarchy is
+  # discovered post-synthesis when a path was not supplied in the recipe.
+  foreach pr_module_name $pr_module_names {
+    if {$pr_module_name ne ""} {
+      create_fileset -blockset -define_from $pr_module_name $pr_module_name
+    }
+  }
+}
 
 # Mark top-level name for future steps/cmds
 set top_level_name overall_fpga_top
@@ -127,12 +157,18 @@ file mkdir ${rpt_dir}
 check_file_exists [set sourceFile ${root_dir}/scripts/strategies/strategy_${strategy}.tcl]
 source $sourceFile
 
-# Run synth/impl and generate collateral
-foreach sourceFile [list ${root_dir}/scripts/synthesis.tcl ${root_dir}/scripts/post_synth.tcl ${root_dir}/scripts/implementation.tcl ${root_dir}/scripts/post_impl.tcl] {
-  set sourceFile [retrieveVersionedFile $sourceFile $vivado_version]
-  check_file_exists $sourceFile
-  source $sourceFile
+# Run synth/impl and generate collateral. PR must create its partition
+# definitions after synthesis and before the implementation run is launched.
+foreach sourceFile [list ${root_dir}/scripts/synthesis.tcl] {
+  source [retrieveVersionedFile $sourceFile $vivado_version]
 }
+if {$pr_enabled} {
+  source ${root_dir}/scripts/post_synth_pr.tcl
+} else {
+  source [retrieveVersionedFile ${root_dir}/scripts/post_synth.tcl $vivado_version]
+}
+source [retrieveVersionedFile ${root_dir}/scripts/implementation.tcl $vivado_version]
+source [retrieveVersionedFile ${root_dir}/scripts/post_impl.tcl $vivado_version]
 
 puts "Done!"
 exit 0

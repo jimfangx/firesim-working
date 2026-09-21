@@ -80,6 +80,9 @@ class BuildConfigFile:
 
         self.build_config_file_path = args.buildconfigfile
         self.build_config_recipes_file_path = args.buildrecipesconfigfile
+        # Retain all recipes: a DFX RM resolves pr_base_recipe on the manager,
+        # where results-build artifacts are authoritative.
+        self.all_build_recipes = build_recipes_config_file
 
         build_recipes = dict()
         for section_name, section_dict in build_recipes_config_file.items():

@@ -10,6 +10,7 @@ set root_dir [file dirname $script_dir]
 #   serial           Serial number of FPGA board (without trailing A)
 array set options {
     -bitstream_path ""
+    -partial_bitstream_path ""
     -probes_path    ""
     -serial         ""
 }
@@ -57,13 +58,19 @@ if {$final_hw_target == ""} {
     exit 1
 }
 
-puts "Programming $final_hw_target with ${options(-bitstream_path)}"
 open_hw_target $final_hw_target
-set_property PROBES.FILE ${options(-probes_path)} [get_hw_device]
-set_property FULL_PROBES.FILE ${options(-probes_path)} [get_hw_device]
-set_property PROGRAM.FILE ${options(-bitstream_path)} [get_hw_device]
-program_hw_devices [get_hw_device]
-refresh_hw_device [get_hw_device]
+if {$options(-partial_bitstream_path) ne ""} {
+    puts "Programming $final_hw_target with partial ${options(-partial_bitstream_path)}"
+    set_property PROGRAM.FILE ${options(-partial_bitstream_path)} [get_hw_device]
+    program_hw_devices [get_hw_device]
+} else {
+    puts "Programming $final_hw_target with ${options(-bitstream_path)}"
+    set_property PROBES.FILE ${options(-probes_path)} [get_hw_device]
+    set_property FULL_PROBES.FILE ${options(-probes_path)} [get_hw_device]
+    set_property PROGRAM.FILE ${options(-bitstream_path)} [get_hw_device]
+    program_hw_devices [get_hw_device]
+    refresh_hw_device [get_hw_device]
+}
 close_hw_target
 
 exit

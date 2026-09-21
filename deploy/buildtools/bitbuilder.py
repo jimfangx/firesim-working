@@ -701,6 +701,39 @@ class XilinxAlveoBitBuilder(BitBuilder):
 
     BOARD_NAME: Optional[str]
 
+    def _resolve_pr_base(self, local_deploy_dir: str) -> tuple[Optional[str], Optional[dict]]:
+        """Resolve manager-local base artifacts before talking to the build host.
+
+        `results-build` belongs to the manager, not to a remote build farm.
+        The returned project is staged separately below, which makes a base
+        built on one machine usable for an RM build on another machine.
+        """
+        project = self.build_config.get_pr_project_path()
+        recipe = self.build_config.get_pr_base_recipe()
+        if recipe and not project:
+            from pathlib import Path
+            recipes = self.build_config.build_config_file.all_build_recipes
+            if recipe not in recipes:
+                raise Exception(f"Unknown pr_base_recipe '{recipe}'")
+            base = recipes[recipe]
+            quintuplet = "-".join((self.build_config.PLATFORM, base["TARGET_PROJECT"], base["DESIGN"], base["TARGET_CONFIG"], base["PLATFORM_CONFIG"]))
+            candidates = sorted((Path(local_deploy_dir) / "results-build").glob(f"*-{recipe}"), reverse=True)
+            for result in candidates:
+                candidate = result / f"cl_{quintuplet}" / "vivado_proj" / "firesim.xpr"
+                if candidate.is_file() and (candidate.parent / "pr_metadata.json").is_file():
+                    project = str(candidate)
+                    break
+            if not project:
+                raise Exception(f"No completed DFX base for '{recipe}' with firesim.xpr and pr_metadata.json")
+        if not project:
+            return None, None
+        metadata_path = os.path.join(os.path.dirname(project), "pr_metadata.json")
+        try:
+            with open(metadata_path) as metadata_file:
+                return project, json.load(metadata_file)
+        except (OSError, json.JSONDecodeError) as error:
+            raise Exception(f"Unable to read base PR metadata at {metadata_path}: {error}")
+
     def __init__(self, build_config: BuildConfig, args: Dict[str, Any]) -> None:
         super().__init__(build_config, args)
         self.BOARD_NAME = None
@@ -817,13 +850,47 @@ class XilinxAlveoBitBuilder(BitBuilder):
         rootLogger.debug(rsync_cap)
         rootLogger.debug(rsync_cap.stderr)
 
+        enable_pr = self.build_config.get_enable_pr()
+        project, base_metadata = self._resolve_pr_base(local_deploy_dir) if enable_pr else (None, None)
         fpga_frequency = self.build_config.get_frequency()
+        if fpga_frequency is None and base_metadata:
+            fpga_frequency = float(base_metadata["frequency_mhz"])
+        if fpga_frequency is None:
+            raise Exception("DFX RM is missing a base frequency in pr_metadata.json")
         build_strategy = self.build_config.get_strategy().name
 
+        module_names = self.build_config.get_pr_module_name()
+        partition_paths = self.build_config.get_pr_partition_path()
+        if base_metadata:
+            modules = base_metadata.get("pr_modules", [])
+            module_names = module_names or [item["module_name"] for item in modules]
+            partition_paths = partition_paths or [path for item in modules for path in item.get("partition_paths", [])]
+        if enable_pr and not module_names:
+            raise Exception("No DFX module name was supplied or found in base metadata")
+
+        # An RM must never write into the archived base. Stage the complete CL
+        # directory (XPR, abstract shell, metadata, and referenced sources) to
+        # the remote build host and rewrite only the remote project path.
+        remote_project = None
+        if project:
+            base_cl = os.path.dirname(os.path.dirname(project))
+            remote_base = f"{cl_dir}/base_project"
+            run(f"rm -rf {remote_base} && mkdir -p {remote_base}")
+            staged = rsync_project(local_dir=f"{base_cl}/", remote_dir=f"{remote_base}/", ssh_opts="-o StrictHostKeyChecking=no", extra_opts="-L", capture=True)
+            if staged.return_code != 0:
+                raise Exception(f"Could not stage DFX base to build host: {staged.stderr}")
+            remote_project = f"{remote_base}/vivado_proj/{os.path.basename(project)}"
+
+        command = f"{cl_dir}/build-bitstream.sh --cl_dir {cl_dir} --frequency {fpga_frequency} --strategy {build_strategy} --board {self.BOARD_NAME}"
+        if enable_pr:
+            command += f" --enable_pr true --pr_module_name {','.join(module_names)}"
+            if partition_paths:
+                command += f" --pr_partition_path {','.join(partition_paths)}"
+            if remote_project:
+                command += f" --pr_project_path {remote_project} --pr_mode {self.build_config.get_pr_mode()}"
+
         with InfoStreamLogger("stdout"), settings(warn_only=True):
-            alveo_result = run(
-                f"{cl_dir}/build-bitstream.sh --cl_dir {cl_dir} --frequency {fpga_frequency} --strategy {build_strategy} --board {self.BOARD_NAME}"
-            )
+            alveo_result = run(command)
             alveo_rc = alveo_result.return_code
 
             if alveo_rc != 0:
@@ -862,11 +929,19 @@ class XilinxAlveoBitBuilder(BitBuilder):
         local(f"rm -rf {tar_staging_path}")
         local(f"mkdir -p {tar_staging_path}")
 
-        # store bitfile (and mcs if it exists)
-        local(f"cp {bit_path} {tar_staging_path}")
-        local(f"cp {mcs_path} {tar_staging_path}")
-        if self.build_config.PLATFORM == "xilinx_vcu118":
-            local(f"cp {mcs_secondary_path} {tar_staging_path}")
+        # An RM tar deliberately contains only its partial plus compatibility
+        # metadata. A base tar keeps the normal full-bit layout unchanged.
+        if enable_pr and project:
+            partial_path = f"{local_cl_dir}/vivado_proj/firesim_impl_rm_0_partial.bit"
+            local(f"cp {partial_path} {tar_staging_path}/firesim_partial.bit")
+            local(f"cp {os.path.dirname(project)}/pr_metadata.json {tar_staging_path}/pr_metadata.json")
+            local(f"sha256sum {os.path.dirname(project)}/firesim.bit | awk '{{print $1}}' > {tar_staging_path}/compatible_base_bit.sha256")
+            tar_name = "firesim_partial.tar.gz"
+        else:
+            local(f"cp {bit_path} {tar_staging_path}")
+            local(f"cp {mcs_path} {tar_staging_path}")
+            if self.build_config.PLATFORM == "xilinx_vcu118":
+                local(f"cp {mcs_secondary_path} {tar_staging_path}")
 
         # store metadata string
         local(f"""echo '{self.get_metadata_string()}' >> {tar_staging_path}/metadata""")
@@ -875,8 +950,20 @@ class XilinxAlveoBitBuilder(BitBuilder):
         with prefix(f"cd {local_cl_dir}"):
             local(f"tar zcvf {tar_name} {self.build_config.PLATFORM}/")
 
+        # The driver was built with the bitstream. Preserve it alongside the
+        # base artifact so an RM built/run on other machines needs no checkout.
+        driver_dir = f"{local_cl_dir}/driver"
+        driver_tar = f"{local_cl_dir}/driver-bundle.tar.gz"
+        if os.path.isdir(driver_dir):
+            local(f"tar -C {driver_dir} -czf {driver_tar} .")
+
         hwdb_entry = hwdb_entry_name + ":\n"
         hwdb_entry += f"    bitstream_tar: file://{local_cl_dir}/{tar_name}\n"
+        if os.path.isfile(driver_tar):
+            hwdb_entry += f"    driver_tar: file://{driver_tar}\n"
+        if enable_pr and project:
+            hwdb_entry += "    # Use bitstream_tar and driver_tar from the matching DFX base.\n"
+            hwdb_entry += f"    partial_bitstream_tar: file://{local_cl_dir}/{tar_name}\n"
         hwdb_entry += f"    deploy_quintuplet_override: null\n"
         hwdb_entry += "    custom_runtime_config: null\n"
 

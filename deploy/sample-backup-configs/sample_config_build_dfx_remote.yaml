@@ -1,0 +1,15 @@
+# Copy or pass with `firesim -b ... -r ... buildbitstream` for the DFX
+# examples. The remote directory is intentionally explicit: this is where the
+# manager stages a base shell when an RM is built on a separate host.
+build_farm:
+  base_recipe: build-farm-recipes/externally_provisioned.yaml
+  recipe_arg_overrides:
+    default_build_dir: /scratch/jfx/firesim-builds
+    build_farm_hosts:
+      - yf328@as4.millennium.berkeley.edu
+
+builds_to_run:
+  - rocket_dfx_base
+
+agfis_to_share: []
+share_with_accounts: {}

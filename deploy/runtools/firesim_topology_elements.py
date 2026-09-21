@@ -372,6 +372,8 @@ class FireSimServerNode(FireSimNode):
         plusargs = self.plusarg_passthrough
         if extra_plusargs is not None:
             plusargs = plusargs + " " + extra_plusargs
+        if self.get_resolved_server_hardware_config().has_partial_bitstream() and "+reset-pulse-length0=" not in plusargs:
+            plusargs += " +reset-pulse-length0=10000000"
 
         runcommand = (
             self.get_resolved_server_hardware_config().get_boot_simulation_command(
@@ -803,6 +805,8 @@ class FireSimSuperNodeServerNode(FireSimServerNode):
         plusargs = self.plusarg_passthrough
         if extra_plusargs is not None:
             plusargs = plusargs + " " + extra_plusargs
+        if self.get_resolved_server_hardware_config().has_partial_bitstream() and "+reset-pulse-length0=" not in plusargs:
+            plusargs += " +reset-pulse-length0=10000000"
 
         runcommand = (
             self.get_resolved_server_hardware_config().get_boot_simulation_command(
