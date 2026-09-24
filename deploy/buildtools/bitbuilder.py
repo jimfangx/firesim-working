@@ -787,6 +787,22 @@ class XilinxAlveoBitBuilder(BitBuilder):
         rootLogger.debug(rsync_cap)
         rootLogger.debug(rsync_cap.stderr)
 
+        if self.build_config.PLATFORM == "xilinx_alveo_u250":
+            # replace-rtl snapshots the platform scripts in cl_<quintuplet>.
+            # Refresh that snapshot at build time so a buildbitstream retry
+            # uses the current upstream normal Tcl and current PR Tcl without
+            # requiring another Golden Gate run.
+            script_sync = rsync_project(
+                local_dir=f"{local_alveo_dir}/cl_firesim/scripts/",
+                remote_dir=f"{dest_alveo_dir}/{fpga_build_postfix}/scripts",
+                ssh_opts="-o StrictHostKeyChecking=no",
+                extra_opts="-L",
+                capture=True,
+            )
+            if script_sync.return_code != 0:
+                raise Exception(f"Could not stage current U250 Tcl scripts: {script_sync.stderr}")
+            rootLogger.debug(script_sync)
+
         return f"{dest_alveo_dir}/{fpga_build_postfix}"
 
     def build_bitstream(self, bypass: bool = False) -> bool:
@@ -832,6 +848,16 @@ class XilinxAlveoBitBuilder(BitBuilder):
             f"{local_deploy_dir}/results-build/{self.build_config.get_build_dir_name()}"
         )
 
+        enable_pr = self.build_config.get_enable_pr()
+        if enable_pr and self.build_config.PLATFORM == "xilinx_alveo_u250":
+            local_platform = f"{local_deploy_dir}/../platforms/{self.build_config.PLATFORM}"
+            local_design = f"{local_platform}/{fpga_build_postfix}/design"
+            splitter = f"{local_deploy_dir}/../sim/scripts/split-verilog.py"
+            local(
+                f"python3 {splitter} {local_design}/FireSim-generated.sv "
+                f"-o {local_design}/split-verilog"
+            )
+
         # 'cl_dir' holds the eventual directory in which vivado will run.
         cl_dir = self.cl_dir_setup(
             self.build_config.get_chisel_quintuplet(),
@@ -850,7 +876,6 @@ class XilinxAlveoBitBuilder(BitBuilder):
         rootLogger.debug(rsync_cap)
         rootLogger.debug(rsync_cap.stderr)
 
-        enable_pr = self.build_config.get_enable_pr()
         project, base_metadata = self._resolve_pr_base(local_deploy_dir) if enable_pr else (None, None)
         fpga_frequency = self.build_config.get_frequency()
         if fpga_frequency is None and base_metadata:
@@ -932,7 +957,15 @@ class XilinxAlveoBitBuilder(BitBuilder):
         # An RM tar deliberately contains only its partial plus compatibility
         # metadata. A base tar keeps the normal full-bit layout unchanged.
         if enable_pr and project:
-            partial_path = f"{local_cl_dir}/vivado_proj/firesim_impl_rm_0_partial.bit"
+            # The proven non-project Tcl writes beside the staged base XPR;
+            # project-mode Tcl writes into the current CL's vivado_proj.
+            partial_candidates = (
+                f"{local_cl_dir}/vivado_proj/firesim_impl_rm_0_partial.bit",
+                f"{local_cl_dir}/base_project/vivado_proj/firesim_impl_rm_0_partial.bit",
+            )
+            partial_path = next((path for path in partial_candidates if os.path.isfile(path)), None)
+            if partial_path is None:
+                raise Exception(f"DFX RM partial bitstream missing; checked {partial_candidates}")
             local(f"cp {partial_path} {tar_staging_path}/firesim_partial.bit")
             local(f"cp {os.path.dirname(project)}/pr_metadata.json {tar_staging_path}/pr_metadata.json")
             local(f"sha256sum {os.path.dirname(project)}/firesim.bit | awk '{{print $1}}' > {tar_staging_path}/compatible_base_bit.sha256")
@@ -957,12 +990,28 @@ class XilinxAlveoBitBuilder(BitBuilder):
         if os.path.isdir(driver_dir):
             local(f"tar -C {driver_dir} -czf {driver_tar} .")
 
-        hwdb_entry = hwdb_entry_name + ":\n"
-        hwdb_entry += f"    bitstream_tar: file://{local_cl_dir}/{tar_name}\n"
-        if os.path.isfile(driver_tar):
-            hwdb_entry += f"    driver_tar: file://{driver_tar}\n"
+        hwdb_bitstream_tar = f"{local_cl_dir}/{tar_name}"
+        hwdb_driver_tar = driver_tar if os.path.isfile(driver_tar) else None
         if enable_pr and project:
-            hwdb_entry += "    # Use bitstream_tar and driver_tar from the matching DFX base.\n"
+            # An RM archive contains only a partial bitstream. Its HWDB entry
+            # must still name the matching base's full bitstream and driver;
+            # partial_bitstream_tar supplies the overlay programmed afterward.
+            base_cl = os.path.dirname(os.path.dirname(project))
+            hwdb_bitstream_tar = f"{base_cl}/firesim.tar.gz"
+            if not os.path.isfile(hwdb_bitstream_tar):
+                raise Exception(
+                    f"Matching DFX base bitstream archive is missing: {hwdb_bitstream_tar}"
+                )
+            base_driver_tar = f"{base_cl}/driver-bundle.tar.gz"
+            hwdb_driver_tar = (
+                base_driver_tar if os.path.isfile(base_driver_tar) else None
+            )
+
+        hwdb_entry = hwdb_entry_name + ":\n"
+        hwdb_entry += f"    bitstream_tar: file://{hwdb_bitstream_tar}\n"
+        if hwdb_driver_tar:
+            hwdb_entry += f"    driver_tar: file://{hwdb_driver_tar}\n"
+        if enable_pr and project:
             hwdb_entry += f"    partial_bitstream_tar: file://{local_cl_dir}/{tar_name}\n"
         hwdb_entry += f"    deploy_quintuplet_override: null\n"
         hwdb_entry += "    custom_runtime_config: null\n"

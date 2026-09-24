@@ -110,6 +110,12 @@ if [ -n "$PR_PROJECT_PATH" ]; then
         echo "DFX RM requires partition paths from base metadata" >&2
         exit 1
     fi
+    python3 "$CL_DIR/scripts/pr_metadata.py" validate \
+        --root_dir "$CL_DIR" \
+        --project_path "$PR_PROJECT_PATH" \
+        --pr_module_names "$PR_MODULE_NAME" \
+        --pr_partition_paths "$PR_PARTITION_PATH" \
+        --frequency "$FREQUENCY" || echo "WARNING: DFX base source validation reported differences"
     case "$PR_MODE" in
       nonproject) script=main_pr_rm_nonproject.tcl ;;
       project) script=main_pr_rm.tcl ;;
@@ -118,5 +124,31 @@ if [ -n "$PR_PROJECT_PATH" ]; then
     vivado -mode batch -source "$CL_DIR/scripts/$script" -tclargs "$FREQUENCY" "$STRATEGY" "$BOARD" "$PR_MODULE_NAME" "$PR_PARTITION_PATH" "$PR_PROJECT_PATH"
 else
     vivado -mode batch -source "$CL_DIR/scripts/main_pr.tcl" -tclargs "$FREQUENCY" "$STRATEGY" "$BOARD" "$PR_MODULE_NAME" "$PR_PARTITION_PATH"
-    python3 "$CL_DIR/scripts/pr_metadata.py" --project-dir "$CL_DIR/vivado_proj" --frequency "$FREQUENCY" --modules "$PR_MODULE_NAME"
+    VIVADO_INFO_FILE="$CL_DIR/vivado_proj/vivado_build_info.txt"
+    DISCOVERED_PATHS_FILE="$CL_DIR/vivado_proj/discovered_pr_paths.txt"
+    VIVADO_VERSION=""
+    PART=""
+    BOARD_PART_VAL=""
+    ACTUAL_FREQ=""
+    if [ -f "$VIVADO_INFO_FILE" ]; then
+        VIVADO_VERSION=$(sed -n 's/^vivado_version=//p' "$VIVADO_INFO_FILE")
+        PART=$(sed -n 's/^part=//p' "$VIVADO_INFO_FILE")
+        BOARD_PART_VAL=$(sed -n 's/^board_part=//p' "$VIVADO_INFO_FILE")
+        ACTUAL_FREQ=$(sed -n 's/^actual_frequency_mhz=//p' "$VIVADO_INFO_FILE")
+    fi
+    metadata_cmd=(python3 "$CL_DIR/scripts/pr_metadata.py" generate
+        --root_dir "$CL_DIR"
+        --frequency "${ACTUAL_FREQ:-$FREQUENCY}"
+        --strategy "$STRATEGY"
+        --pr_module_names "$PR_MODULE_NAME"
+        --vivado_version "$VIVADO_VERSION"
+        --part "$PART"
+        --board_part "$BOARD_PART_VAL")
+    if [ -n "$PR_PARTITION_PATH" ]; then
+        metadata_cmd+=(--pr_partition_paths "$PR_PARTITION_PATH")
+    fi
+    if [ -f "$DISCOVERED_PATHS_FILE" ]; then
+        metadata_cmd+=(--discovered_paths_file "$DISCOVERED_PATHS_FILE")
+    fi
+    "${metadata_cmd[@]}"
 fi
