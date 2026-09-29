@@ -716,6 +716,10 @@ class XilinxAlveoBitBuilder(BitBuilder):
             if recipe not in recipes:
                 raise Exception(f"Unknown pr_base_recipe '{recipe}'")
             base = recipes[recipe]
+            if base.get("PLATFORM") != self.build_config.PLATFORM:
+                raise Exception(
+                    f"DFX base '{recipe}' targets {base.get('PLATFORM')}, not {self.build_config.PLATFORM}"
+                )
             quintuplet = "-".join((self.build_config.PLATFORM, base["TARGET_PROJECT"], base["DESIGN"], base["TARGET_CONFIG"], base["PLATFORM_CONFIG"]))
             candidates = sorted((Path(local_deploy_dir) / "results-build").glob(f"*-{recipe}"), reverse=True)
             for result in candidates:
@@ -787,7 +791,7 @@ class XilinxAlveoBitBuilder(BitBuilder):
         rootLogger.debug(rsync_cap)
         rootLogger.debug(rsync_cap.stderr)
 
-        if self.build_config.PLATFORM == "xilinx_alveo_u250":
+        if self.build_config.PLATFORM in ("xilinx_alveo_u250", "corigine_xb10"):
             # replace-rtl snapshots the platform scripts in cl_<quintuplet>.
             # Refresh that snapshot at build time so a buildbitstream retry
             # uses the current upstream normal Tcl and current PR Tcl without
@@ -800,7 +804,7 @@ class XilinxAlveoBitBuilder(BitBuilder):
                 capture=True,
             )
             if script_sync.return_code != 0:
-                raise Exception(f"Could not stage current U250 Tcl scripts: {script_sync.stderr}")
+                raise Exception(f"Could not stage current {self.build_config.PLATFORM} Tcl scripts: {script_sync.stderr}")
             rootLogger.debug(script_sync)
 
         return f"{dest_alveo_dir}/{fpga_build_postfix}"
@@ -849,7 +853,7 @@ class XilinxAlveoBitBuilder(BitBuilder):
         )
 
         enable_pr = self.build_config.get_enable_pr()
-        if enable_pr and self.build_config.PLATFORM == "xilinx_alveo_u250":
+        if enable_pr and self.build_config.PLATFORM in ("xilinx_alveo_u250", "corigine_xb10"):
             local_platform = f"{local_deploy_dir}/../platforms/{self.build_config.PLATFORM}"
             local_design = f"{local_platform}/{fpga_build_postfix}/design"
             splitter = f"{local_deploy_dir}/../sim/scripts/split-verilog.py"
@@ -877,6 +881,17 @@ class XilinxAlveoBitBuilder(BitBuilder):
         rootLogger.debug(rsync_cap.stderr)
 
         project, base_metadata = self._resolve_pr_base(local_deploy_dir) if enable_pr else (None, None)
+        if base_metadata:
+            expected_parts = {
+                "xilinx_alveo_u250": "xcu250-figd2104-2l-e",
+                "corigine_xb10": "xcvu19p-fsvb3824-2-e",
+            }
+            expected_part = expected_parts.get(self.build_config.PLATFORM)
+            if expected_part and base_metadata.get("part", "").lower() != expected_part:
+                raise Exception(
+                    f"DFX base part {base_metadata.get('part')!r} does not match "
+                    f"{self.build_config.PLATFORM} ({expected_part})"
+                )
         fpga_frequency = self.build_config.get_frequency()
         if fpga_frequency is None and base_metadata:
             fpga_frequency = float(base_metadata["frequency_mhz"])
@@ -1062,6 +1077,12 @@ class XilinxAlveoU250BitBuilder(XilinxAlveoBitBuilder):
     def __init__(self, build_config: BuildConfig, args: Dict[str, Any]) -> None:
         super().__init__(build_config, args)
         self.BOARD_NAME = "au250"
+
+
+class CorigineXB10BitBuilder(XilinxAlveoBitBuilder):
+    def __init__(self, build_config: BuildConfig, args: Dict[str, Any]) -> None:
+        super().__init__(build_config, args)
+        self.BOARD_NAME = "xb10"
 
 
 class XilinxVCU118BitBuilder(XilinxAlveoBitBuilder):

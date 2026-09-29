@@ -1,0 +1,363 @@
+set root_dir [pwd]
+set vivado_version [version -short]
+set vivado_version_major [string range $vivado_version 0 3]
+
+set ifrequency           [lindex $argv 0]
+set istrategy            [lindex $argv 1]
+set iboard               [lindex $argv 2]
+set pr_module_name_str   [lindex $argv 3]
+set pr_partition_path_str [lindex $argv 4]
+set pr_project_path       [lindex $argv 5]
+set pr_partition_module_name_str [lindex $argv 6]
+
+# Parse comma-separated lists into TCL lists
+set pr_module_names {}
+foreach name [split $pr_module_name_str ","] {
+    lappend pr_module_names [string trim $name]
+}
+
+set pr_partition_paths {}
+foreach path [split $pr_partition_path_str ","] {
+    lappend pr_partition_paths [string trim $path]
+}
+
+set pr_partition_module_names {}
+if {[string trim $pr_partition_module_name_str] ne ""} {
+    foreach name [split $pr_partition_module_name_str ","] {
+        lappend pr_partition_module_names [string trim $name]
+    }
+    if {[llength $pr_partition_module_names] != [llength $pr_module_names]} {
+        puts "ERROR: pr_partition_module_names count ([llength $pr_partition_module_names]) does not match pr_module_names count ([llength $pr_module_names])"
+        exit 1
+    }
+} else {
+    set pr_partition_module_names $pr_module_names
+}
+
+if {[llength $pr_module_names] != [llength $pr_partition_paths]} {
+    puts "ERROR: Number of PR module names ([llength $pr_module_names]) does not match number of partition paths ([llength $pr_partition_paths])"
+    exit 1
+}
+
+puts "PR RM Swap Configuration:"
+for {set i 0} {$i < [llength $pr_module_names]} {incr i} {
+    puts "  Module [expr {$i + 1}]: [lindex $pr_module_names $i] -> [lindex $pr_partition_paths $i]"
+}
+
+if {$pr_project_path eq ""} {
+    puts "ERROR: pr_project_path must be provided for main_pr_rm.tcl"
+    exit 1
+}
+if {![file exists $pr_project_path]} {
+    puts "ERROR: PR project path does not exist: $pr_project_path"
+    exit 1
+}
+
+# The base project is already a copy (bitbuilder.py copies it into cl_dir/base_project/
+# to protect the original in results-build from corruption by create_reconfig_module).
+# $PPRDIR-relative source file references resolve correctly because the full
+# cl_* directory structure (vivado_proj/ + design/) was copied together.
+set local_vivado_proj [file dirname $pr_project_path]
+
+# RM source files live in split-verilog/. Only the RM .sv is added to the
+# RM fileset; the static shell is a locked routed checkpoint and does not
+# depend on sources_1 at all.
+set src_split_verilog "${root_dir}/design/split-verilog"
+
+open_project $pr_project_path
+
+# Source the PR-only helpers; leave the normal FireSim helper path untouched.
+set project_scripts_dir [file dirname [file normalize [info script]]]
+source ${project_scripts_dir}/utils_pr.tcl
+source ${project_scripts_dir}/platform_env_pr.tcl
+
+# Timing tracking
+set script_start_time [clock seconds]
+set timing_log {}
+
+proc format_time { seconds } {
+    set hours [expr {int($seconds / 3600)}]
+    set minutes [expr {int(($seconds % 3600) / 60)}]
+    set secs [expr {int($seconds % 60)}]
+    if {$hours > 0} {
+        return [format "%dh %dm %ds" $hours $minutes $secs]
+    } elseif {$minutes > 0} {
+        return [format "%dm %ds" $minutes $secs]
+    } else {
+        return [format "%ds" $secs]
+    }
+}
+
+proc log_timing { phase_name start_time } {
+    global timing_log
+    set current_time [clock seconds]
+    set elapsed [expr {$current_time - $start_time}]
+    lappend timing_log [list $phase_name $elapsed]
+    puts "TIMING: $phase_name took [format_time $elapsed]"
+    return $current_time
+}
+
+# Load strategy settings (used for OOC synth options)
+set sourceFile ${project_scripts_dir}/strategies/strategy_${istrategy}_pr.tcl
+if {![file exists $sourceFile]} {
+    puts "ERROR: Strategy file not found: $sourceFile"
+    exit 1
+}
+source $sourceFile
+
+set phase_start [clock seconds]
+
+# Phase 1: Create RM filesets.
+# create_reconfig_module closes any open design, so all RMs must be created
+# before opening the synth checkpoint in Phase 2.
+set rm_runs {}
+set rm_synth_runs {}
+set rm_impl_info {}
+
+for {set i 0} {$i < [llength $pr_module_names]} {incr i} {
+    set pr_module_name           [lindex $pr_module_names $i]
+    set pr_partition_module_name [lindex $pr_partition_module_names $i]
+    set pr_partition_path        [lindex $pr_partition_paths $i]
+    set partition_def_name       "pr_partition_${pr_partition_module_name}"
+    set reconfig_module_name     "pr_reconfig_module_${i}"
+
+    puts "Creating RM '$reconfig_module_name': module=$pr_module_name partition_def=$partition_def_name"
+
+    # Clean up any leftover RM with the same name from a prior (possibly failed)
+    # iteration. Without this, rerunning main_pr_rm.tcl on the same project hits
+    # [filemgmt 56-194] "RM '...' is not unique in the project".
+    if {[llength [get_reconfig_modules -quiet $reconfig_module_name]] > 0} {
+        puts "  Removing stale reconfig module '$reconfig_module_name'"
+        delete_reconfig_modules $reconfig_module_name
+    }
+
+    create_reconfig_module -name $reconfig_module_name \
+        -partition_def [get_partition_defs $partition_def_name] \
+        -top $pr_module_name
+
+    # Add RM source file + all other module .sv files from split-verilog.
+    # The RM wrapper (ReconfigurablePrefetcher.sv) instantiates a concrete
+    # prefetcher submodule (BestOffsetPrefetcher.sv etc) that lives in its
+    # own .sv, and those submodules themselves may pull in further modules
+    # from split-verilog (e.g., memory primitives). Vivado only synthesizes
+    # modules actually referenced from the RM top, so adding the whole
+    # directory is safe: unused modules are ignored.
+    set rm_source "${src_split_verilog}/${pr_module_name}.sv"
+    if {![file exists $rm_source]} {
+        puts "ERROR: RM source not found: $rm_source"
+        exit 1
+    }
+    set rm_sv_files [glob -nocomplain "${src_split_verilog}/*.sv"]
+    add_files $rm_sv_files -of_objects [get_reconfig_modules $reconfig_module_name]
+
+    # Add OOC clock constraint for RM synthesis
+    set rm_xdc_dir "${root_dir}/vivado_proj/rm_xdc"
+    file mkdir $rm_xdc_dir
+    set rm_xdc "${rm_xdc_dir}/${reconfig_module_name}_ooc.xdc"
+    set ooc_period [expr {1000.0 / $ifrequency}]
+    set rm_xdc_fh [open $rm_xdc w]
+    puts $rm_xdc_fh "create_clock -name user_clock -period $ooc_period \[get_ports clock\]"
+    close $rm_xdc_fh
+    add_files $rm_xdc -of_objects [get_reconfig_modules $reconfig_module_name]
+    set_property USED_IN {out_of_context synthesis implementation} \
+        [get_files -of_objects [get_reconfig_modules $reconfig_module_name] $rm_xdc]
+
+    # Configure OOC synthesis run
+    set synth_run_name "${reconfig_module_name}_synth_1"
+    if {[llength [get_runs -quiet $synth_run_name]] > 0} {
+        set_property -dict [ list \
+            STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE ${synth_directive} \
+            {STEPS.SYNTH_DESIGN.ARGS.MORE OPTIONS} "${synth_options}" \
+        ] [get_runs $synth_run_name]
+        lappend rm_synth_runs $synth_run_name
+    } else {
+        puts "WARNING: No OOC synthesis run found for $reconfig_module_name"
+    }
+
+    lappend rm_impl_info [list $pr_partition_path $reconfig_module_name $i]
+}
+
+# Phase 2: Open synth checkpoint, create impl runs.
+# Abstract shell DFX mode requires -rm_instance (not -pr_config).
+open_run synth_1
+
+foreach rm_info $rm_impl_info {
+    lassign $rm_info pr_partition_path reconfig_module_name impl_idx
+    set run_name "impl_rm_${impl_idx}"
+
+    # Clean up any leftover impl run with the same name from a prior
+    # (possibly failed) iteration. delete_reconfig_modules does not also
+    # delete the impl_rm_N run tied to the RM.
+    if {[llength [get_runs -quiet $run_name]] > 0} {
+        puts "  Removing stale impl run '$run_name'"
+        delete_runs $run_name
+    }
+
+    puts "Creating impl run '$run_name': $pr_partition_path -> $reconfig_module_name"
+    create_run $run_name -parent_run impl_1 -flow {Vivado Implementation 2023} \
+        -rm_instance ${pr_partition_path}:${reconfig_module_name}
+
+    # Use lightweight directives for RM impl — the module is small and
+    # constrained to a pblock, so Explore/Aggressive strategies waste time.
+    # For debug iterations where timing closure is not required, set
+    # FIRESIM_PR_RM_FAST=1 to pick Quick directives on opt/place/route,
+    # trading some QoR for ~30-40% faster impl wall clock.
+    set fast [expr {[info exists ::env(FIRESIM_PR_RM_FAST)] && $::env(FIRESIM_PR_RM_FAST) ne "0"}]
+    if {$fast} {
+        set opt_dir  "RuntimeOptimized"
+        set pl_dir   "Quick"
+        set rt_dir   "Quick"
+        puts "  FIRESIM_PR_RM_FAST=1: using Quick directives"
+    } else {
+        set opt_dir  "Default"
+        set pl_dir   "Default"
+        set rt_dir   "Default"
+    }
+    set_property -dict [ list \
+        STEPS.OPT_DESIGN.IS_ENABLED 1 \
+        STEPS.OPT_DESIGN.DIRECTIVE $opt_dir \
+        STEPS.PLACE_DESIGN.DIRECTIVE $pl_dir \
+        STEPS.PHYS_OPT_DESIGN.IS_ENABLED 0 \
+        STEPS.ROUTE_DESIGN.DIRECTIVE $rt_dir \
+    ] [get_runs $run_name]
+
+    lappend rm_runs $run_name
+}
+
+close_design
+
+# Delete default report configs to skip unnecessary report generation
+foreach run [concat $rm_synth_runs $rm_runs] {
+    foreach rc [get_report_configs -of_objects [get_runs $run] -quiet] {
+        delete_report_config $rc
+    }
+}
+
+set phase_start [log_timing "RM setup" $phase_start]
+
+# Step 1: OOC synthesis
+if {[llength $rm_synth_runs] > 0} {
+    puts "Launching RM OOC synthesis: $rm_synth_runs"
+    launch_runs $rm_synth_runs -jobs $jobs
+    wait_on_runs $rm_synth_runs
+
+    foreach run_name $rm_synth_runs {
+        if {[get_property PROGRESS [get_runs $run_name]] ne "100%"} {
+            puts "ERROR: OOC synthesis run $run_name failed"
+            exit 1
+        }
+    }
+}
+
+set phase_start [log_timing "RM OOC synthesis" $phase_start]
+
+# Step 2: Implementation (place + route)
+if {[llength $rm_runs] > 0} {
+    puts "Launching RM implementation: $rm_runs"
+    launch_runs $rm_runs -to_step route_design -jobs $jobs
+    wait_on_runs $rm_runs
+
+    foreach run_name $rm_runs {
+        set run_progress [get_property PROGRESS [get_runs $run_name]]
+        if {$run_progress ne "100%"} {
+            puts "ERROR: RM implementation $run_name did not complete (progress=$run_progress)"
+            exit 1
+        }
+    }
+
+    # Check timing
+    foreach run_name $rm_runs {
+        puts "  $run_name WNS: [get_property STATS.WNS [get_runs $run_name]] ns"
+    }
+
+    # Emit the PARTIAL bitstream directly from each RM's cell-level routed DCP.
+    # This is the only bit we need at runtime for an RP swap — the static
+    # region is already programmed from the base build. Skipping the full-bit
+    # merge (base DCP open + black-box + lock + read RM cell + write full bit)
+    # saves ~14 min per iteration on Rocket.
+    #
+    # To re-enable full-bit emission (needed for initial power-on programming,
+    # or when the static must also change) set env var FIRESIM_PR_EMIT_FULL=1.
+    set top_level_name overall_fpga_top
+    set emit_full [expr {[info exists ::env(FIRESIM_PR_EMIT_FULL)] && $::env(FIRESIM_PR_EMIT_FULL) ne "0"}]
+    file mkdir ${root_dir}/vivado_proj
+
+    set abs_shell_dcp "${local_vivado_proj}/abs_shell.dcp"
+    if {![file exists $abs_shell_dcp]} {
+        error "XB-10 DFX: base abstract shell checkpoint not found: $abs_shell_dcp"
+    }
+
+    for {set i 0} {$i < [llength $rm_runs]} {incr i} {
+        set run_name [lindex $rm_runs $i]
+        lassign [lindex $rm_impl_info $i] pr_partition_path reconfig_module_name impl_idx
+
+        # Find the RM cell-level routed checkpoint
+        set rm_run_dir "${local_vivado_proj}/firesim.runs/${run_name}"
+        set rm_cell_dcp [glob -nocomplain "${rm_run_dir}/*_${reconfig_module_name}_routed.dcp"]
+        if {[llength $rm_cell_dcp] == 0} {
+            puts "ERROR: RM cell routed checkpoint not found in: $rm_run_dir"
+            puts "  Available files:"
+            foreach f [glob -nocomplain "${rm_run_dir}/*.dcp"] {
+                puts "    [file tail $f]"
+            }
+            exit 1
+        }
+        set rm_cell_dcp [lindex $rm_cell_dcp 0]
+
+        # The impl_rm_*/overall_fpga_top_routed.dcp is the abstract-shell-based
+        # merged checkpoint with the new RM in place. Opening it is fast (~12
+        # MB vs 129 MB for the full routed DCP) and it can emit the partial.
+        set shell_routed_dcp "${rm_run_dir}/${top_level_name}_routed.dcp"
+        if {![file exists $shell_routed_dcp]} {
+            puts "ERROR: Shell+RM routed checkpoint not found: $shell_routed_dcp"
+            exit 1
+        }
+
+        set verify_report "${root_dir}/vivado_proj/firesim_${run_name}_pr_verify.rpt"
+        pr_verify -file $verify_report $abs_shell_dcp $shell_routed_dcp
+
+        puts "Emitting partial bitstream for $run_name..."
+        puts "  Shell+RM DCP: $shell_routed_dcp  ([expr {[file size $shell_routed_dcp] / 1024 / 1024}] MB)"
+        puts "  RM cell DCP:  $rm_cell_dcp  ([expr {[file size $rm_cell_dcp] / 1024}] KB)"
+
+        open_checkpoint $shell_routed_dcp
+        set partial_bit "${root_dir}/vivado_proj/firesim_${run_name}_partial.bit"
+        puts "  Writing partial bitstream: $partial_bit"
+        write_bitstream -force -cell $pr_partition_path $partial_bit
+        puts "  Partial bit size: [expr {[file size $partial_bit] / 1024}] KB"
+
+        if {$emit_full} {
+            puts "  FIRESIM_PR_EMIT_FULL=1: also writing full bitstream..."
+            set full_bit "${root_dir}/vivado_proj/firesim_${run_name}.bit"
+            write_bitstream -force $full_bit
+            puts "  Full bit size: [expr {[file size $full_bit] / 1024 / 1024}] MB"
+        }
+
+        close_design
+        puts "  Done."
+    }
+
+    # MCS (QSPI image) only makes sense with a full bit; skip in partial-only mode.
+    if {$emit_full} {
+        set first_full_bit "${root_dir}/vivado_proj/firesim_[lindex $rm_runs 0].bit"
+        set firesim_bit_path "${root_dir}/vivado_proj/firesim.bit"
+        file copy -force $first_full_bit $firesim_bit_path
+        write_cfgmem -force -format mcs -interface SPIx4 -size 1024 \
+            -loadbit "up 0x01002000 ${firesim_bit_path}" -verbose ${root_dir}/vivado_proj/firesim.mcs
+    }
+}
+
+# Timing summary
+set total_time [expr {[clock seconds] - $script_start_time}]
+puts "=========================================="
+puts "BUILD TIMING SUMMARY (PR RM MODE)"
+puts "=========================================="
+foreach timing_entry $timing_log {
+    puts [format "  %-35s %s" [lindex $timing_entry 0] [format_time [lindex $timing_entry 1]]]
+}
+puts "=========================================="
+puts [format "  %-35s %s" "TOTAL BUILD TIME" [format_time $total_time]]
+puts "=========================================="
+
+puts "Done!"
+exit 0

@@ -6,6 +6,7 @@ import re
 import logging
 import abc
 import json
+import shlex
 from fabric.api import prefix, local, run, env, cd, warn_only, put, settings, hide  # type: ignore
 from fabric.contrib.project import rsync_project  # type: ignore
 from os.path import join as pjoin
@@ -1058,6 +1059,14 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
         super().__init__(parent_node)
         self.PLATFORM_NAME = None
 
+    def fpga_tool_args(self) -> str:
+        """Optional tool locations for platform FPGA utility scripts."""
+        return ""
+
+    def fpga_db_generator(self, remote_sim_dir: str) -> str:
+        """Return the FPGA database generator installed on the run host."""
+        return f"{script_path}/firesim-generate-fpga-db.py"
+
     def load_xdma(self) -> None:
         """load the xdma kernel module."""
         if self.instance_assigned_simulations():
@@ -1283,14 +1292,17 @@ class XilinxAlveoInstanceDeployManager(InstanceDeployManager):
         json_db = self.parent_node.get_fpga_db()
 
         with cd(remote_sim_dir):
-            # Use a system wide installed firesim-generate-fpga-db.py
-            cmd = f"{script_path}/firesim-generate-fpga-db.py"
+            # Vivado creates this directory with the effective user's
+            # ownership.  A prior privileged invocation can otherwise prevent
+            # subsequent FireSim runs from opening the hardware manager.
+            run("rm -rf .Xil")
+            cmd = self.fpga_db_generator(remote_sim_dir)
             check_script(
                 cmd,
                 Path(f"{get_deploy_dir()}/../platforms/{self.PLATFORM_NAME}/scripts"),
             )
             run(
-                f"""{cmd} --bitstream {bitstream} --driver {driver} --out-db-json {json_db}"""
+                f"""{cmd} --bitstream {bitstream} --driver {driver} --out-db-json {json_db}{self.fpga_tool_args()}"""
             )
 
     def enumerate_fpgas(self, uridir: str) -> None:
@@ -1353,6 +1365,169 @@ class XilinxAlveoU250InstanceDeployManager(XilinxAlveoInstanceDeployManager):
     def __init__(self, parent_node: Inst) -> None:
         super().__init__(parent_node)
         self.PLATFORM_NAME = "xilinx_alveo_u250"
+
+
+class CorigineXB10InstanceDeployManager(XilinxAlveoInstanceDeployManager):
+    def __init__(self, parent_node: Inst) -> None:
+        super().__init__(parent_node)
+        self.PLATFORM_NAME = "corigine_xb10"
+
+    def xb10_hardware_tools(self) -> Tuple[str, str]:
+        """Locate Vivado Lab and hw_server without assuming an install path."""
+        manager_vivado = os.environ.get("FIRESIM_VIVADO_BIN")
+        if manager_vivado:
+            quoted_manager_vivado = shlex.quote(manager_vivado)
+            vivado_result = run(
+                f"test -x {quoted_manager_vivado} && printf '%s\\n' {quoted_manager_vivado}",
+                warn_only=True,
+            )
+        else:
+            vivado_result = run(
+                """if [ -n "${FIRESIM_VIVADO_BIN:-}" ] && [ -x "${FIRESIM_VIVADO_BIN}" ]; then
+    printf '%s\n' "${FIRESIM_VIVADO_BIN}"
+elif [ -n "${XILINX_VIVADO_LAB:-}" ] && [ -x "${XILINX_VIVADO_LAB}/bin/vivado_lab" ]; then
+    printf '%s\n' "${XILINX_VIVADO_LAB}/bin/vivado_lab"
+elif [ -n "${XILINX_VIVADO:-}" ] && [ -x "${XILINX_VIVADO}/bin/vivado" ]; then
+    printf '%s\n' "${XILINX_VIVADO}/bin/vivado"
+else
+    command -v vivado_lab || command -v vivado
+fi""",
+                warn_only=True,
+            )
+        vivado = vivado_result.strip()
+        if vivado_result.return_code != 0 or not vivado:
+            raise RuntimeError(
+                "Could not find XB-10 Vivado Lab. Set FIRESIM_VIVADO_BIN, "
+                "source the Xilinx settings script, or add vivado_lab to PATH."
+            )
+
+        vivado_bin_dir = shlex.quote(str(Path(vivado).parent))
+        manager_hw_server = os.environ.get("FIRESIM_HW_SERVER_BIN")
+        if manager_hw_server:
+            quoted_manager_hw_server = shlex.quote(manager_hw_server)
+            hw_server_result = run(
+                f"test -x {quoted_manager_hw_server} && printf '%s\\n' {quoted_manager_hw_server}",
+                warn_only=True,
+            )
+        else:
+            hw_server_result = run(
+                f"""if [ -n "${{FIRESIM_HW_SERVER_BIN:-}}" ] && [ -x "${{FIRESIM_HW_SERVER_BIN}}" ]; then
+    printf '%s\\n' "${{FIRESIM_HW_SERVER_BIN}}"
+elif [ -x {vivado_bin_dir}/hw_server ]; then
+    printf '%s\\n' {vivado_bin_dir}/hw_server
+elif [ -n "${{XILINX_VIVADO_LAB:-}}" ] && [ -x "${{XILINX_VIVADO_LAB}}/bin/hw_server" ]; then
+    printf '%s\\n' "${{XILINX_VIVADO_LAB}}/bin/hw_server"
+elif [ -n "${{XILINX_VIVADO:-}}" ] && [ -x "${{XILINX_VIVADO}}/bin/hw_server" ]; then
+    printf '%s\\n' "${{XILINX_VIVADO}}/bin/hw_server"
+else
+    command -v hw_server
+fi""",
+                warn_only=True,
+            )
+        hw_server = hw_server_result.strip()
+        if hw_server_result.return_code != 0 or not hw_server:
+            raise RuntimeError(
+                "Could not find XB-10 hw_server. Set FIRESIM_HW_SERVER_BIN, "
+                "source the Xilinx settings script, or add hw_server to PATH."
+            )
+        return vivado, hw_server
+
+    def fpga_tool_args(self) -> str:
+        """Pass resolved Lab tools to enumeration and PCIe utility scripts."""
+        vivado, hw_server = self.xb10_hardware_tools()
+        return f" --vivado-bin {shlex.quote(vivado)} --hw-server-bin {shlex.quote(hw_server)}"
+
+    def fpga_db_generator(self, remote_sim_dir: str) -> str:
+        """Use the XB-10 generator, which can bootstrap an empty PCIe slot."""
+        return f"{remote_sim_dir}/scripts/firesim-generate-fpga-db.py"
+
+    def enumerate_fpgas(self, uridir: str) -> None:
+        """Program, enumerate, and then enable XDMA for an XB-10."""
+        if not self.instance_assigned_simulations():
+            return
+
+        self.unload_xdma()
+        self.create_fpga_database(uridir)
+        self.load_xdma()
+        self.change_all_pcie_perms()
+
+    def flash_fpgas(self) -> None:
+        """Program an XB-10 fleet in one Vivado session, including DFX overlays."""
+        if not self.instance_assigned_simulations():
+            return
+
+        json_db = self.parent_node.get_fpga_db()
+        tool_args = self.fpga_tool_args()
+        db = json.loads(run(f"cat {json_db}"))
+        mapping_lines = []
+        scripts_dir = None
+
+        for slotno, serv in enumerate(self.parent_node.sim_slots):
+            hwcfg = serv.get_resolved_server_hardware_config()
+            remote_sim_dir = self.get_remote_sim_dir_for_slot(slotno)
+            bitstream_dir = f"{remote_sim_dir}/{self.PLATFORM_NAME}"
+            bit = f"{bitstream_dir}/firesim.bit"
+            run(f"rm -rf {bitstream_dir}")
+            run(f"tar xvf {remote_sim_dir}/{hwcfg.get_bitstream_tar_filename()} -C {remote_sim_dir}")
+
+            partial_bit = "-"
+            if hwcfg.has_partial_bitstream():
+                partial_dir = f"{remote_sim_dir}/{self.PLATFORM_NAME}_partial"
+                run(f"rm -rf {partial_dir} && mkdir -p {partial_dir}")
+                run(f"tar xvf {remote_sim_dir}/{hwcfg.get_partial_bitstream_tar_filename()} -C {partial_dir}")
+                partial_bit = run(
+                    f"find {partial_dir} -name 'firesim*_partial.bit' -print -quit",
+                    warn_only=True,
+                ).strip()
+                if not partial_bit:
+                    raise RuntimeError(f"DFX partial bitstream is missing for slot {slotno}")
+                expected = run(
+                    f"find {partial_dir} -name compatible_base_bit.sha256 -exec cat {{}} \\; -quit",
+                    warn_only=True,
+                ).strip()
+                actual = run(f"sha256sum {bit} | awk '{{print $1}}'").strip()
+                if not expected or expected != actual:
+                    raise RuntimeError(
+                        f"DFX base mismatch for slot {slotno}: partial expects {expected}, full bit is {actual}"
+                    )
+
+            if scripts_dir is None:
+                rsync_cap = rsync_project(
+                    local_dir=f"../platforms/{self.PLATFORM_NAME}/scripts",
+                    remote_dir=remote_sim_dir,
+                    ssh_opts="-o StrictHostKeyChecking=no",
+                    extra_opts="-L -p",
+                    capture=True,
+                )
+                if rsync_cap.return_code != 0:
+                    raise RuntimeError(f"Could not stage XB-10 programming scripts: {rsync_cap.stderr}")
+                scripts_dir = f"{remote_sim_dir}/scripts"
+
+            if slotno >= len(db):
+                raise RuntimeError(f"Less FPGAs than slots ({slotno} >= {len(db)})")
+            uid = db[slotno]["uid"]
+            mapping_lines.append(f"{uid} {bit} {partial_bit}")
+
+        fpga_util = f"{script_path}/firesim-fpga-util.py"
+        check_script(fpga_util, Path(f"{get_deploy_dir()}/../platforms/{self.PLATFORM_NAME}/scripts"))
+
+        map_file = f"{self.get_remote_sim_dir_for_slot(0)}/flash_map.txt"
+        map_content = "\n".join(mapping_lines)
+        run(f"cat > {map_file} << 'MAPEOF'\n{map_content}\nMAPEOF")
+
+        vivado, hw_server = self.xb10_hardware_tools()
+
+        disconnected_bdfs = []
+        try:
+            for slotno in range(len(mapping_lines)):
+                bdf = db[slotno]["bdf"]
+                run(f"{fpga_util} --bdf {bdf} --disconnect-bdf --fpga-db {json_db}{tool_args}")
+                disconnected_bdfs.append(bdf)
+            hw_server_dir = shlex.quote(str(Path(hw_server).parent))
+            run(f"PATH={hw_server_dir}:$PATH {shlex.quote(vivado)} -mode batch -source {shlex.quote(scripts_dir)}/program_fpga_fleet.tcl -tclargs -map_file {shlex.quote(map_file)}")
+        finally:
+            for bdf in disconnected_bdfs:
+                run(f"{fpga_util} --bdf {bdf} --reconnect-bdf --fpga-db {json_db}{tool_args}")
 
 
 class XilinxAlveoU280InstanceDeployManager(XilinxAlveoInstanceDeployManager):

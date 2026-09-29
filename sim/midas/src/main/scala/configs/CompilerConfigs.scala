@@ -115,6 +115,14 @@ class BaseXilinxAlveoU250Config
         new midas.XilinxAlveoU250Config
     )
 
+class BaseCorigineXB10Config
+    extends Config(
+      new WithDefaultMemModel ++
+        new WithWiringTransform ++
+        new WithAsyncResetReplacement ++
+        new midas.CorigineXB10Config
+    )
+
 class BaseXilinxAlveoU280Config
     extends Config(
       new WithDefaultMemModel ++
